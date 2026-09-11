@@ -1,0 +1,289 @@
+name: Multica screenshots
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout runner repo
+        uses: actions/checkout@v6
+
+      - name: Clone Multica
+        run: git clone --depth 1 https://github.com/multica-ai/multica.git multica
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        working-directory: multica
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+          pnpm --version
+
+      - name: Install dependencies
+        working-directory: multica
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        working-directory: multica
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Configure local self-host
+        working-directory: multica
+        run: |
+          cat > .env <<'EOF'
+          JWT_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          MULTICA_DEV_VERIFICATION_CODE=123456
+          ALLOW_SIGNUP=true
+          FRONTEND_ORIGIN=http://localhost:3000
+          MULTICA_APP_URL=http://localhost:3000
+          DATABASE_URL=postgres://multica:multica@localhost:5432/multica?sslmode=disable
+          POSTGRES_DB=multica
+          POSTGRES_USER=multica
+          POSTGRES_PASSWORD=multica
+          EOF
+
+      - name: Build and start Multica
+        working-directory: multica
+        run: |
+          docker compose \
+            -f docker-compose.selfhost.yml \
+            -f docker-compose.selfhost.build.yml \
+            -f docker-compose.yml \
+            up -d --build
+
+          echo "Waiting for backend and frontend..."
+          for i in $(seq 1 120); do
+            backend_code="$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/ 2>/dev/null || true)"
+            frontend_code="$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:3000/login 2>/dev/null || true)"
+            if [ "$backend_code" != "000" ] && [ -n "$backend_code" ] && [ "$frontend_code" = "200" ]; then
+              echo "Multica is ready (backend HTTP $backend_code, frontend HTTP $frontend_code)"
+              break
+            fi
+            if [ "$i" = "120" ]; then
+              echo "Multica did not become ready"
+              docker compose \
+                -f docker-compose.selfhost.yml \
+                -f docker-compose.selfhost.build.yml \
+                -f docker-compose.yml \
+                ps
+              docker compose \
+                -f docker-compose.selfhost.yml \
+                -f docker-compose.selfhost.build.yml \
+                -f docker-compose.yml \
+                logs --tail=200
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Add screenshot capture spec
+        working-directory: multica
+        run: |
+          cat > e2e/chatgpt-screenshots.spec.ts <<'EOF'
+          import { test } from "@playwright/test";
+          import pg from "pg";
+          import { mkdir, writeFile } from "node:fs/promises";
+          import { join } from "node:path";
+          import { createTestApi } from "./helpers";
+
+          const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? process.env.FRONTEND_ORIGIN ?? "http://localhost:3000";
+          const DATABASE_URL = process.env.DATABASE_URL ?? "postgres://multica:multica@localhost:5432/multica?sslmode=disable";
+          const OUT = process.env.SCREENSHOT_DIR ?? "artifacts/multica-screenshots";
+
+          type Capture = {
+            route: string;
+            requestedUrl: string;
+            finalUrl: string;
+            status: number | null;
+            title: string;
+            screenshot: string;
+            error: string;
+          };
+
+          function filenameFor(route: string, index: number) {
+            const slug = route
+              .replace(/^\//, "")
+              .replace(/\[(.*?)\]/g, "$1")
+              .replace(/[^a-zA-Z0-9._-]+/g, "-")
+              .replace(/^-+|-+$/g, "") || "root";
+            return `${String(index + 1).padStart(2, "0")}-${slug}.png`;
+          }
+
+          async function capture(page: any, route: string, index: number, rows: Capture[]) {
+            const requestedUrl = new URL(route, BASE_URL).toString();
+            const screenshot = filenameFor(route, index);
+            let status: number | null = null;
+            let error = "";
+            try {
+              const response = await page.goto(requestedUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+              status = response?.status() ?? null;
+              await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+              await page.waitForTimeout(750);
+            } catch (e) {
+              error = e instanceof Error ? e.message : String(e);
+            }
+
+            let title = "";
+            try { title = await page.title(); } catch {}
+            try {
+              await page.screenshot({ path: join(OUT, screenshot), fullPage: true, animations: "disabled" });
+            } catch (e) {
+              const text = e instanceof Error ? e.message : String(e);
+              error = error ? `${error} | screenshot: ${text}` : `screenshot: ${text}`;
+            }
+
+            rows.push({ route, requestedUrl, finalUrl: page.url(), status, title, screenshot, error });
+          }
+
+          test("capture every Multica web route", async ({ browser }) => {
+            test.setTimeout(12 * 60_000);
+            await mkdir(OUT, { recursive: true });
+
+            const api = await createTestApi();
+            const workspace = (await api.getWorkspaces())[0];
+            if (!workspace) throw new Error("E2E workspace missing");
+            api.setWorkspaceId(workspace.id);
+            api.setWorkspaceSlug(workspace.slug);
+
+            const issue = await api.createIssue("Screenshot fixture issue", {
+              description: "Fixture created only for the screenshot run.",
+              priority: "medium",
+            });
+
+            const db = new pg.Client(DATABASE_URL);
+            await db.connect();
+            const user = await db.query<{ id: string }>(
+              `SELECT id::text FROM "user" WHERE email = $1 LIMIT 1`,
+              [api.getEmail()],
+            );
+            const userId = user.rows[0]?.id;
+            if (!userId) throw new Error("E2E user missing");
+
+            let runtimeId = "00000000-0000-0000-0000-000000000000";
+            let agentId = "00000000-0000-0000-0000-000000000000";
+            try {
+              const runtime = await db.query<{ id: string }>(
+                `INSERT INTO agent_runtime (
+                   workspace_id, daemon_id, name, runtime_mode, provider, status,
+                   device_info, metadata, last_seen_at
+                 )
+                 VALUES ($1, NULL, $2, 'cloud', 'screenshot_fixture', 'online', $3, '{}'::jsonb, now())
+                 RETURNING id::text`,
+                [workspace.id, "Screenshot Runtime", "Screenshot fixture runtime"],
+              );
+              runtimeId = runtime.rows[0]!.id;
+
+              const agent = await db.query<{ id: string }>(
+                `INSERT INTO agent (
+                   workspace_id, name, description, instructions, runtime_mode,
+                   runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id
+                 )
+                 VALUES ($1, 'Screenshot Agent', 'Fixture agent for screenshots', '', 'cloud',
+                         '{}'::jsonb, $2, 'workspace', 1, $3)
+                 RETURNING id::text`,
+                [workspace.id, runtimeId, userId],
+              );
+              agentId = agent.rows[0]!.id;
+            } catch (e) {
+              console.warn("Could not seed runtime/agent fixtures", e);
+            }
+
+            const token = api.getToken();
+            if (!token) throw new Error("E2E token missing");
+
+            const publicRoutes = [
+              "/", "/homepage", "/about", "/changelog", "/contact-sales", "/download",
+              "/usecases", "/usecases/software-development", "/invitations",
+              "/invite/00000000-0000-0000-0000-000000000000", "/login", "/onboarding",
+              "/workspaces/new", "/auth/callback", "/billing/return", "/join",
+              "/dingtalk/bind", "/lark/bind", "/slack/bind", "/telegram/bind", "/wecom/bind",
+            ];
+
+            const ws = `/${workspace.slug}`;
+            const authenticatedRoutes = [
+              `${ws}/agents`, `${ws}/agents/${agentId}`, `${ws}/agents/new`, `${ws}/agents/new/ai`,
+              `${ws}/agents/new/ai/00000000-0000-0000-0000-000000000000`, `${ws}/agents/new/manual`,
+              `${ws}/autopilots`, `${ws}/autopilots/00000000-0000-0000-0000-000000000000`,
+              `${ws}/billing`, `${ws}/chat`, `${ws}/inbox`, `${ws}/issues`, `${ws}/issues/${issue.id}`,
+              `${ws}/members/${userId}`, `${ws}/my-issues`, `${ws}/projects`,
+              `${ws}/projects/00000000-0000-0000-0000-000000000000`, `${ws}/runtimes`,
+              `${ws}/runtimes/${runtimeId}`, `${ws}/runtimes/${runtimeId}/runtime/${runtimeId}`,
+              `${ws}/settings`, `${ws}/skills`, `${ws}/skills/00000000-0000-0000-0000-000000000000`,
+              `${ws}/squads`, `${ws}/squads/00000000-0000-0000-0000-000000000000`, `${ws}/usage`,
+              `${ws}/attachments/00000000-0000-0000-0000-000000000000/preview`,
+            ];
+
+            const rows: Capture[] = [];
+            const publicContext = await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: "light" });
+            const publicPage = await publicContext.newPage();
+            for (let i = 0; i < publicRoutes.length; i++) await capture(publicPage, publicRoutes[i]!, i, rows);
+            await publicContext.close();
+
+            const authContext = await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: "light" });
+            await authContext.addInitScript((authToken) => {
+              localStorage.setItem("multica_token", authToken);
+              localStorage.setItem("multica:chat:isOpen", "false");
+            }, token);
+            const authPage = await authContext.newPage();
+            for (let i = 0; i < authenticatedRoutes.length; i++) {
+              await capture(authPage, authenticatedRoutes[i]!, publicRoutes.length + i, rows);
+            }
+            await authContext.close();
+
+            const csvEscape = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
+            const header = ["route", "requestedUrl", "finalUrl", "status", "title", "screenshot", "error"];
+            const csv = [header.join(","), ...rows.map((r) => header.map((k) => csvEscape((r as any)[k])).join(","))].join("\n");
+            await writeFile(join(OUT, "manifest.csv"), csv + "\n", "utf8");
+            await writeFile(join(OUT, "manifest.json"), JSON.stringify(rows, null, 2) + "\n", "utf8");
+
+            if (agentId !== "00000000-0000-0000-0000-000000000000") await db.query(`DELETE FROM agent WHERE id = $1`, [agentId]);
+            if (runtimeId !== "00000000-0000-0000-0000-000000000000") await db.query(`DELETE FROM agent_runtime WHERE id = $1`, [runtimeId]);
+            await db.end();
+            await api.cleanup();
+          });
+          EOF
+
+      - name: Capture screenshots
+        working-directory: multica
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3000
+          FRONTEND_ORIGIN: http://localhost:3000
+          DATABASE_URL: postgres://multica:multica@localhost:5432/multica?sslmode=disable
+          SCREENSHOT_DIR: artifacts/multica-screenshots
+        run: pnpm exec playwright test e2e/chatgpt-screenshots.spec.ts --project=chromium --reporter=line
+
+      - name: Show service logs on failure
+        if: failure()
+        working-directory: multica
+        run: |
+          docker compose \
+            -f docker-compose.selfhost.yml \
+            -f docker-compose.selfhost.build.yml \
+            -f docker-compose.yml \
+            ps || true
+          docker compose \
+            -f docker-compose.selfhost.yml \
+            -f docker-compose.selfhost.build.yml \
+            -f docker-compose.yml \
+            logs --tail=300 || true
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multica-screenshots
+          path: multica/artifacts/multica-screenshots
+          if-no-files-found: warn
+          retention-days: 7
