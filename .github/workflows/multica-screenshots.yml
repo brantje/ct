@@ -1,0 +1,396 @@
+name: Multica screenshot capture
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: multica
+          POSTGRES_PASSWORD: multica
+          POSTGRES_DB: multica
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U multica -d multica"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout pinned Multica source
+        uses: actions/checkout@v4
+        with:
+          repository: multica-ai/multica
+          ref: 2ae2dbbb8f9ed9ffe1739ecf5abfe31a940ee50c
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+          run_install: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Configure local environment
+        run: |
+          FORCE=1 WORKTREE_NAME=ci bash scripts/init-worktree-env.sh .env
+          sed -i 's/^POSTGRES_DB=.*/POSTGRES_DB=multica/' .env
+          sed -i 's#^DATABASE_URL=.*#DATABASE_URL=postgres://multica:multica@localhost:5432/multica?sslmode=disable#' .env
+          printf '\nAPP_ENV=development\n' >> .env
+          cat .env
+
+      - name: Run migrations
+        run: |
+          set -a
+          . ./.env
+          set +a
+          cd server
+          go run ./cmd/migrate up
+
+      - name: Start backend and frontend
+        run: |
+          set -a
+          . ./.env
+          set +a
+          (cd server && nohup go run ./cmd/server > ../backend.log 2>&1 & echo $! > ../backend.pid)
+          nohup pnpm dev:web > frontend.log 2>&1 & echo $! > frontend.pid
+          echo "Waiting for backend on $PORT"
+          timeout 120 bash -c "until curl -fsS http://localhost:$PORT/health >/dev/null; do sleep 2; done"
+          echo "Waiting for frontend on $FRONTEND_PORT"
+          timeout 180 bash -c "until curl -fsS http://localhost:$FRONTEND_PORT/ >/dev/null; do sleep 2; done"
+
+      - name: Add screenshot test
+        run: |
+          cat > e2e/screenshot-all.spec.ts <<'EOF'
+          import { test, type Page } from "@playwright/test";
+          import fs from "node:fs";
+          import path from "node:path";
+          import pg from "pg";
+          import { loginAsDefault } from "./helpers";
+
+          const OUT = path.resolve("multica-screenshots");
+          fs.mkdirSync(OUT, { recursive: true });
+
+          type Entry = {
+            template: string;
+            url: string;
+            finalUrl?: string;
+            title?: string;
+            httpStatus?: number | null;
+            screenshot: string;
+            note?: string;
+            error?: string;
+          };
+          const manifest: Entry[] = [];
+
+          function filename(template: string) {
+            if (template === "/") return "00-root.png";
+            return template
+              .replace(/^\//, "")
+              .replace(/\[([^\]]+)\]/g, "$1")
+              .replace(/[^a-zA-Z0-9._-]+/g, "-")
+              .replace(/^-|-$/g, "") + ".png";
+          }
+
+          async function shot(page: Page, template: string, url: string, note?: string) {
+            const file = filename(template);
+            let status: number | null = null;
+            try {
+              const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+              status = response?.status() ?? null;
+              await page.waitForTimeout(1400);
+              await page.screenshot({ path: path.join(OUT, file), fullPage: true });
+              manifest.push({
+                template,
+                url,
+                finalUrl: page.url(),
+                title: await page.title(),
+                httpStatus: status,
+                screenshot: file,
+                note,
+              });
+            } catch (err) {
+              try {
+                await page.screenshot({ path: path.join(OUT, file), fullPage: true });
+              } catch {}
+              manifest.push({
+                template,
+                url,
+                finalUrl: page.url(),
+                httpStatus: status,
+                screenshot: file,
+                note,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          async function apiJson(
+            base: string,
+            token: string,
+            workspaceSlug: string | null,
+            route: string,
+            init: RequestInit = {},
+          ) {
+            const headers: Record<string, string> = {
+              Authorization: `Bearer ${token}`,
+              ...(init.body ? { "Content-Type": "application/json" } : {}),
+              ...((init.headers as Record<string, string> | undefined) ?? {}),
+            };
+            if (workspaceSlug) headers["X-Workspace-Slug"] = workspaceSlug;
+            const response = await fetch(`${base}${route}`, { ...init, headers });
+            const text = await response.text();
+            if (!response.ok) {
+              throw new Error(`${init.method ?? "GET"} ${route} -> ${response.status}: ${text.slice(0, 400)}`);
+            }
+            return text ? JSON.parse(text) : null;
+          }
+
+          test("capture every Multica web route", async ({ page }) => {
+            test.setTimeout(18 * 60 * 1000);
+
+            const publicRoutes: Array<[string, string, string?]> = [
+              ["/", "/"],
+              ["/homepage", "/homepage"],
+              ["/about", "/about"],
+              ["/changelog", "/changelog"],
+              ["/contact-sales", "/contact-sales"],
+              ["/download", "/download"],
+              ["/usecases", "/usecases"],
+              ["/usecases/[slug]", "/usecases/auto-data-analysis", "Representative concrete use-case slug"],
+              ["/login", "/login"],
+              ["/onboarding", "/onboarding"],
+              ["/invite/[id]", "/invite/00000000-0000-0000-0000-000000000000", "No real invitation is created; shows the route's invalid/expired state"],
+              ["/auth/callback", "/auth/callback?error=access_denied", "Representative callback error state"],
+              ["/billing/return", "/billing/return?session_id=screenshot", "Representative return state without an external billing session"],
+              ["/join", "/join"],
+              ["/dingtalk/bind", "/dingtalk/bind"],
+              ["/lark/bind", "/lark/bind"],
+              ["/slack/bind", "/slack/bind"],
+              ["/telegram/bind", "/telegram/bind"],
+              ["/wecom/bind", "/wecom/bind"],
+            ];
+            for (const [template, url, note] of publicRoutes) await shot(page, template, url, note);
+
+            const workspaceSlug = await loginAsDefault(page);
+            const token = await page.evaluate(() => localStorage.getItem("multica_token"));
+            if (!token) throw new Error("Authenticated browser did not contain multica_token");
+            const apiBase = process.env.NEXT_PUBLIC_API_URL || `http://localhost:${process.env.PORT || "8080"}`;
+
+            const workspaces = await apiJson(apiBase, token, null, "/api/workspaces");
+            const workspace = workspaces.find((w: any) => w.slug === workspaceSlug) ?? workspaces[0];
+            if (!workspace) throw new Error("E2E workspace missing after login");
+            const me = await apiJson(apiBase, token, workspaceSlug, "/api/me");
+
+            const created: Record<string, any> = {};
+            const create = async (key: string, route: string, body: unknown) => {
+              try {
+                created[key] = await apiJson(apiBase, token, workspaceSlug, route, {
+                  method: "POST",
+                  body: JSON.stringify(body),
+                });
+              } catch (err) {
+                created[key] = { _error: err instanceof Error ? err.message : String(err) };
+                console.warn(`Could not create ${key}:`, created[key]._error);
+              }
+            };
+
+            await create("issue", "/api/issues", {
+              title: "Screenshot fixture issue",
+              description: "Created only for the page-capture run.",
+              priority: "medium",
+            });
+            await create("project", "/api/projects", {
+              title: "Screenshot Fixture Project",
+              description: "Representative project for route screenshots.",
+            });
+            await create("skill", "/api/skills", {
+              name: "Screenshot Fixture Skill",
+              description: "Representative skill for route screenshots.",
+              content: "# Screenshot Fixture Skill\n\nA deterministic skill created by the screenshot run.",
+            });
+
+            const db = new pg.Client({ connectionString: process.env.DATABASE_URL });
+            await db.connect();
+            try {
+              const rt = await db.query(
+                `INSERT INTO agent_runtime
+                  (workspace_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+                 VALUES ($1, 'Screenshot Runtime', 'local', 'codex', 'online', 'GitHub Actions fixture', '{}'::jsonb, $2, now())
+                 RETURNING id`,
+                [workspace.id, me.id],
+              );
+              created.runtime = { id: rt.rows[0].id };
+            } catch (err) {
+              created.runtime = { _error: err instanceof Error ? err.message : String(err) };
+              console.warn("Could not create runtime:", created.runtime._error);
+            } finally {
+              await db.end();
+            }
+
+            if (created.runtime?.id) {
+              await create("agent", "/api/agents", {
+                name: "Screenshot Agent",
+                description: "Representative agent created for screenshots.",
+                instructions: "Do useful work and report clearly.",
+                runtime_id: created.runtime.id,
+                visibility: "workspace",
+              });
+            }
+            if (created.agent?.id) {
+              await create("squad", "/api/squads", {
+                name: "Screenshot Squad",
+                description: "Representative squad created for screenshots.",
+                leader_id: created.agent.id,
+              });
+              await create("autopilot", "/api/autopilots", {
+                title: "Screenshot Autopilot",
+                description: "Representative scheduled automation.",
+                project_id: created.project?.id ?? null,
+                assignee_type: "agent",
+                assignee_id: created.agent.id,
+                execution_mode: "create_issue",
+                issue_title_template: "Screenshot scheduled issue",
+              });
+            }
+
+            try {
+              const members = await apiJson(apiBase, token, workspaceSlug, `/api/workspaces/${workspace.id}/members`);
+              created.member = Array.isArray(members) ? members[0] : members?.members?.[0];
+            } catch (err) {
+              created.member = { _error: err instanceof Error ? err.message : String(err) };
+            }
+
+            const authRoutes: Array<[string, string, string?]> = [
+              ["/invitations", "/invitations"],
+              ["/workspaces/new", "/workspaces/new"],
+              ["/[workspaceSlug]/agents", `/${workspaceSlug}/agents`],
+              ["/[workspaceSlug]/agents/new", `/${workspaceSlug}/agents/new`],
+              ["/[workspaceSlug]/agents/new/ai", `/${workspaceSlug}/agents/new/ai`],
+              ["/[workspaceSlug]/agents/new/manual", `/${workspaceSlug}/agents/new/manual`],
+              ["/[workspaceSlug]/autopilots", `/${workspaceSlug}/autopilots`],
+              ["/[workspaceSlug]/billing", `/${workspaceSlug}/billing`],
+              ["/[workspaceSlug]/chat", `/${workspaceSlug}/chat`],
+              ["/[workspaceSlug]/inbox", `/${workspaceSlug}/inbox`],
+              ["/[workspaceSlug]/issues", `/${workspaceSlug}/issues`],
+              ["/[workspaceSlug]/my-issues", `/${workspaceSlug}/my-issues`],
+              ["/[workspaceSlug]/projects", `/${workspaceSlug}/projects`],
+              ["/[workspaceSlug]/runtimes", `/${workspaceSlug}/runtimes`],
+              ["/[workspaceSlug]/settings", `/${workspaceSlug}/settings`],
+              ["/[workspaceSlug]/skills", `/${workspaceSlug}/skills`],
+              ["/[workspaceSlug]/squads", `/${workspaceSlug}/squads`],
+              ["/[workspaceSlug]/usage", `/${workspaceSlug}/usage`],
+              [
+                "/[workspaceSlug]/agents/[id]",
+                `/${workspaceSlug}/agents/${created.agent?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.agent?.id ? "Seeded agent detail" : "Agent fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/autopilots/[id]",
+                `/${workspaceSlug}/autopilots/${created.autopilot?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.autopilot?.id ? "Seeded autopilot detail" : "Autopilot fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/issues/[id]",
+                `/${workspaceSlug}/issues/${created.issue?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.issue?.id ? "Seeded issue detail" : "Issue fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/members/[id]",
+                `/${workspaceSlug}/members/${created.member?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.member?.id ? "Current E2E workspace member" : "Member lookup failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/projects/[id]",
+                `/${workspaceSlug}/projects/${created.project?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.project?.id ? "Seeded project detail" : "Project fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/runtimes/[id]",
+                `/${workspaceSlug}/runtimes/${created.runtime?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.runtime?.id ? "Seeded runtime detail" : "Runtime fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/runtimes/[id]/runtime/[runtimeId]",
+                `/${workspaceSlug}/runtimes/${created.runtime?.id ?? "00000000-0000-0000-0000-000000000000"}/runtime/${created.runtime?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                "Best-effort runtime settings route using the seeded runtime ID",
+              ],
+              [
+                "/[workspaceSlug]/skills/[id]",
+                `/${workspaceSlug}/skills/${created.skill?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.skill?.id ? "Seeded skill detail" : "Skill fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/squads/[id]",
+                `/${workspaceSlug}/squads/${created.squad?.id ?? "00000000-0000-0000-0000-000000000000"}`,
+                created.squad?.id ? "Seeded squad detail" : "Squad fixture creation failed; captured missing-detail state",
+              ],
+              [
+                "/[workspaceSlug]/agents/new/ai/[sessionId]",
+                `/${workspaceSlug}/agents/new/ai/00000000-0000-0000-0000-000000000000`,
+                "No agent-builder runtime conversation was started; captured missing-session state",
+              ],
+              [
+                "/[workspaceSlug]/attachments/[id]/preview",
+                `/${workspaceSlug}/attachments/00000000-0000-0000-0000-000000000000/preview`,
+                "No attachment upload is needed for route inventory; captured missing-attachment state",
+              ],
+            ];
+
+            for (const [template, url, note] of authRoutes) await shot(page, template, url, note);
+
+            fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify({
+              commit: "2ae2dbbb8f9ed9ffe1739ecf5abfe31a940ee50c",
+              workspaceSlug,
+              createdFixtures: created,
+              screenshots: manifest,
+            }, null, 2));
+          });
+          EOF
+
+      - name: Capture all route screenshots
+        run: |
+          set -a
+          . ./.env
+          set +a
+          pnpm exec playwright test e2e/screenshot-all.spec.ts --project=chromium
+
+      - name: Copy logs into artifact
+        if: always()
+        run: |
+          mkdir -p multica-screenshots
+          cp backend.log frontend.log multica-screenshots/ 2>/dev/null || true
+
+      - name: Upload screenshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multica-screenshots
+          path: multica-screenshots/
+          if-no-files-found: warn
+          retention-days: 3
